@@ -18,9 +18,10 @@ from collections.abc import Sequence
 from copy import copy
 
 from qiskit import QuantumCircuit
-from qiskit.primitives import BaseSampler
+from qiskit.primitives import BaseSampler, BaseEstimator
 from qiskit.primitives.primitive_job import PrimitiveJob
 from qiskit.providers import Options
+from qiskit.quantum_info import SparsePauliOp
 
 from ..exceptions import AlgorithmError
 from .base_state_fidelity import BaseStateFidelity
@@ -53,9 +54,10 @@ class ComputeUncompute(BaseStateFidelity):
 
     def __init__(
         self,
-        sampler: BaseSampler,
+        sampler: BaseSampler = None,
         options: Options | None = None,
         local: bool = False,
+        estimator: BaseEstimator = None,
     ) -> None:
         r"""
         Args:
@@ -79,11 +81,22 @@ class ComputeUncompute(BaseStateFidelity):
         Raises:
             ValueError: If the sampler is not an instance of ``BaseSampler``.
         """
-        if not isinstance(sampler, BaseSampler):
+        if sampler is None and estimator is None:
+            raise ValueError("Either sampler or estimator must be specified")
+        if sampler is not None and estimator is not None:
+            # sampler overtakes estimator, this may be changed in the future
+            estimator = None
+        if sampler is not None and not isinstance(sampler, BaseSampler):
             raise ValueError(
                 f"The sampler should be an instance of BaseSampler, " f"but got {type(sampler)}"
             )
-        self._sampler: BaseSampler = sampler
+        if estimator is not None and not isinstance(estimator, BaseEstimator):
+            raise ValueError(
+                f"The estimator should be an instance of BaseEstimator, " f"but got {type(estimator)}"
+            )
+
+        self._sampler: BaseSampler | None = sampler
+        self._estimator: BaseEstimator | None = estimator
         self._local = local
         self._default_options = Options()
         if options is not None:
@@ -110,7 +123,8 @@ class ComputeUncompute(BaseStateFidelity):
             circuit_2.remove_final_measurements()
 
         circuit = circuit_1.compose(circuit_2.inverse())
-        circuit.measure_all()
+        if self._sampler is not None:
+            circuit.measure_all()
         return circuit
 
     def _run(
@@ -157,7 +171,13 @@ class ComputeUncompute(BaseStateFidelity):
         opts = copy(self._default_options)
         opts.update_options(**options)
 
-        sampler_job = self._sampler.run(circuits=circuits, parameter_values=values, **opts.__dict__)
+        if self._sampler is not None:
+            job = self._sampler.run(circuits=circuits, parameter_values=values, **opts.__dict__)
+        elif self._estimator is not None:
+            observable = self._create_observable()
+            job = self._estimator.run(circuits=circuits, )
+        else:
+            raise ValueError("Unreachable code: no sampler, no estimator")
 
         local_opts = self._get_local_options(opts.__dict__)
         return AlgorithmJob(ComputeUncompute._call, sampler_job, circuits, self._local, local_opts)
@@ -169,7 +189,7 @@ class ComputeUncompute(BaseStateFidelity):
         try:
             result = job.result()
         except Exception as exc:
-            raise AlgorithmError("Sampler job failed!") from exc
+            raise AlgorithmError("Primitive job failed!") from exc
 
         if local:
             raw_fidelities = [
@@ -256,3 +276,11 @@ class ComputeUncompute(BaseStateFidelity):
                 if not bitstring >> qubit & 1:
                     fidelity += prob / num_qubits
         return fidelity
+
+    def _create_observable(self, num_qubits: int):
+        elementary = SparsePauliOp.from_list([("I", 0.5), ("Z", 0.5)])
+        observable = elementary
+        for i in range(num_qubits - 1):
+            observable = observable.tensor(elementary)
+        return observable
+
